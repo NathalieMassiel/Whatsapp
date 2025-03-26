@@ -4,7 +4,7 @@ FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 WORKDIR /app
 
 # Copiar archivos del proyecto
-COPY *.csproj ./
+COPY WhatsApp_Endpoints.csproj ./
 RUN dotnet restore
 
 # Copiar el resto del código
