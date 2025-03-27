@@ -22,6 +22,7 @@ COPY --from=publish /app/publish .
 
 # Configure container properties
 ENV ASPNETCORE_URLS=http://+:80
+ENV META_TOKEN=placeholder_value
 EXPOSE 80
 
 # Start the application
