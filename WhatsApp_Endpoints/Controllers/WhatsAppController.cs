@@ -5,6 +5,8 @@ using System.Text;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
 using System;
+using Microsoft.Data.SqlClient;
+using Dapper;
 
 namespace WhatsApp_Endpoints.Entities
 {
@@ -24,63 +26,46 @@ namespace WhatsApp_Endpoints.Entities
         [HttpPost("send-message")]
         public async Task<IActionResult> SendMessage([FromForm] WhatsAppRequestDto request)
         {
-            // 1) Extraer el token de acceso (Access Token)
             string metaToken = request.MetaToken ?? _configuration["META_TOKEN"] ?? string.Empty;
             if (string.IsNullOrEmpty(metaToken))
-            {
                 return BadRequest(new { error = "Missing META token" });
-            }
 
-            // 2) Crear el payload
             var payload = new
             {
                 messaging_product = "whatsapp",
-                to = request.EndUserNumber ?? string.Empty,
-                text = new { body = request.Message ?? string.Empty }
+                to = request.EndUserNumber,
+                text = new { body = request.Message }
             };
 
-            // 3) Construir la petición
             var httpRequest = new HttpRequestMessage(
                 HttpMethod.Post,
-                // <--- Aquí es vital usar el Phone Number ID, no el Business Account ID
-                $"https://graph.facebook.com/v22.0/{request.PhoneNumberId ?? string.Empty}/messages"
-            )
+                $"https://graph.facebook.com/v22.0/{request.PhoneNumberId}/messages")
             {
                 Headers = { { "Authorization", $"Bearer {metaToken}" } },
-                Content = new StringContent(
-                    JsonSerializer.Serialize(payload),
-                    Encoding.UTF8,
-                    "application/json"
-                )
+                Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
             };
 
-            // 4) Enviar y leer la respuesta
             var response = await _httpClient.SendAsync(httpRequest);
             var responseData = await response.Content.ReadAsStringAsync();
 
             if (!response.IsSuccessStatusCode)
-            {
                 return BadRequest(new { error = "Failed to send message", details = responseData });
-            }
+
+            using var conn = new SqlConnection(_configuration.GetConnectionString("DefaultConnection"));
+            await conn.ExecuteAsync("INSERT INTO WhatsAppMessages (PhoneNumber, Direction, Content, Timestamp) VALUES (@to, 'outbound', @body, GETUTCDATE())",
+                new { to = request.EndUserNumber, body = request.Message });
 
             return Ok(new { success = "Message sent successfully!" });
         }
-
 
         [HttpGet("webhook")]
         public IActionResult VerifyWebhook(
             [FromQuery(Name = "hub.mode")] string hubMode,
             [FromQuery(Name = "hub.verify_token")] string hubVerifyToken,
-            [FromQuery(Name = "hub.challenge")] string hubChallenge
-        )
+            [FromQuery(Name = "hub.challenge")] string hubChallenge)
         {
-            // This line logs the incoming verification parameters to the console
-            Console.WriteLine($"[META] mode={hubMode}, token={hubVerifyToken}, challenge={hubChallenge}");
-
             if (hubMode == "subscribe" && hubVerifyToken == "abc123")
-            {
                 return Content(hubChallenge, "text/plain");
-            }
 
             return Forbid();
         }
@@ -88,66 +73,54 @@ namespace WhatsApp_Endpoints.Entities
         [HttpPost("webhook")]
         public async Task<IActionResult> ReceiveWebhook([FromBody] JsonDocument body)
         {
-            if (string.IsNullOrEmpty(_configuration["META_TOKEN"]))
-            {
-                return BadRequest(new { error = "Missing META_TOKEN environment variable" });
-            }
-
             try
             {
-                var entry = body.RootElement.GetProperty("entry")[0]
-                                     .GetProperty("changes")[0]
-                                     .GetProperty("value");
+                var entry = body.RootElement.GetProperty("entry")[0];
+                var changes = entry.GetProperty("changes")[0];
+                var value = changes.GetProperty("value");
 
-                var message = entry.GetProperty("messages")[0];
-                var phoneNumberId = entry.GetProperty("metadata")
-                                         .GetProperty("phone_number_id")
-                                         .GetString() ?? string.Empty;
+                // ✅ Validar si "messages" existe
+                if (!value.TryGetProperty("messages", out var messagesElement) || messagesElement.GetArrayLength() == 0)
+                {
+                    Console.WriteLine("Webhook recibido sin mensajes. Puede ser una notificación de estado.");
+                    return Ok();
+                }
 
+                var message = messagesElement[0];
+
+                // ✅ Validar tipo de mensaje
                 if (message.GetProperty("type").GetString() == "text")
                 {
-                    var responsePayload = new
-                    {
-                        messaging_product = "whatsapp",
-                        to = message.GetProperty("from").GetString() ?? string.Empty,
-                        text = new
-                        {
-                            body = "Echo: " + (message.GetProperty("text")
-                                                     .GetProperty("body")
-                                                     .GetString() ?? string.Empty)
-                        },
-                        context = new
-                        {
-                            message_id = message.GetProperty("id").GetString() ?? string.Empty
-                        }
-                    };
+                    var from = message.GetProperty("from").GetString();
+                    var content = message.GetProperty("text").GetProperty("body").GetString();
 
-                    var httpRequest = new HttpRequestMessage(
-                        HttpMethod.Post,
-                        $"https://graph.facebook.com/v22.0/{phoneNumberId}/messages"
-                    )
-                    {
-                        Headers = { { "Authorization", $"Bearer {_configuration["META_TOKEN"] ?? string.Empty}" } },
-                        Content = new StringContent(JsonSerializer.Serialize(responsePayload), Encoding.UTF8, "application/json")
-                    };
+                    Console.WriteLine($"Mensaje INBOUND recibido de {from}: {content}");
 
-                    var response = await _httpClient.SendAsync(httpRequest);
-                    var responseData = await response.Content.ReadAsStringAsync();
-
-                    if (!response.IsSuccessStatusCode)
-                    {
-                        return BadRequest(new { error = "Error sending message", details = responseData });
-                    }
-
-                    return Ok(new { success = "Message sent" });
+                    using var conn = new SqlConnection(_configuration.GetConnectionString("DefaultConnection"));
+                    await conn.ExecuteAsync(
+                        "INSERT INTO WhatsAppMessages (PhoneNumber, Direction, Content, Timestamp) VALUES (@from, 'inbound', @content, GETUTCDATE())",
+                        new { from, content });
                 }
-            }
-            catch (JsonException ex)
-            {
-                return BadRequest(new { error = "Invalid JSON format", details = ex.Message });
-            }
 
-            return Ok(new { success = "Webhook received!" });
+                return Ok();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error en ReceiveWebhook: {ex.Message}");
+                return BadRequest(new { error = ex.Message });
+            }
+        }
+
+
+        [HttpGet("messages/{number}")]
+        public async Task<IActionResult> GetMessages(string number)
+        {
+            var sql = "SELECT PhoneNumber, Direction, Content, Timestamp FROM WhatsAppMessages WHERE PhoneNumber = @Number ORDER BY Timestamp ASC";
+
+            using var conn = new SqlConnection(_configuration.GetConnectionString("DefaultConnection"));
+            var messages = await conn.QueryAsync(sql, new { Number = number });
+
+            return Ok(messages);
         }
     }
 }
