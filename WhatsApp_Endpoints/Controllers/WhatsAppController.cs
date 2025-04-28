@@ -7,8 +7,10 @@ using Microsoft.Extensions.Configuration;
 using System;
 using Microsoft.Data.SqlClient;
 using Dapper;
+using System.Collections.Generic;
+using WhatsApp_Endpoints.Entities;
 
-namespace WhatsApp_Endpoints.Entities
+namespace YourNamespaceHere
 {
     [ApiController]
     [Route("api/whatsapp")]
@@ -52,10 +54,31 @@ namespace WhatsApp_Endpoints.Entities
                 return BadRequest(new { error = "Failed to send message", details = responseData });
 
             using var conn = new SqlConnection(_configuration.GetConnectionString("DefaultConnection"));
-            await conn.ExecuteAsync("INSERT INTO WhatsAppMessages (PhoneNumber, Direction, Content, Timestamp) VALUES (@to, 'outbound', @body, GETUTCDATE())",
+            await conn.ExecuteAsync(
+                @"INSERT INTO WhatsAppMessages (PhoneNumber, Direction, Content, Timestamp, MessageType) 
+                  VALUES (@to, 'outbound', @body, GETUTCDATE(), 'text')",
                 new { to = request.EndUserNumber, body = request.Message });
 
             return Ok(new { success = "Message sent successfully!" });
+        }
+        [HttpPost("save-template-message")]
+        public async Task<IActionResult> SaveTemplateMessage([FromBody] WhatsApp_Endpoints.Entities.SaveTemplateMessageRequestDto request)
+        {
+            try
+            {
+                using var conn = new SqlConnection(_configuration.GetConnectionString("DefaultConnection"));
+                await conn.ExecuteAsync(
+                    @"INSERT INTO WhatsAppMessages (PhoneNumber, Direction, Content, Timestamp, MessageType) 
+                      VALUES (@PhoneNumber, 'outbound', @Content, GETUTCDATE(), 'template')",
+                    new { PhoneNumber = request.PhoneNumber, Content = request.Content });
+
+                return Ok(new { success = "Template message saved successfully!" });
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error en SaveTemplateMessage: {ex.Message}");
+                return BadRequest(new { error = ex.Message });
+            }
         }
 
         [HttpGet("webhook")]
@@ -79,7 +102,6 @@ namespace WhatsApp_Endpoints.Entities
                 var changes = entry.GetProperty("changes")[0];
                 var value = changes.GetProperty("value");
 
-                // ✅ Validar si "messages" existe
                 if (!value.TryGetProperty("messages", out var messagesElement) || messagesElement.GetArrayLength() == 0)
                 {
                     Console.WriteLine("Webhook recibido sin mensajes. Puede ser una notificación de estado.");
@@ -88,7 +110,6 @@ namespace WhatsApp_Endpoints.Entities
 
                 var message = messagesElement[0];
 
-                // ✅ Validar tipo de mensaje
                 if (message.GetProperty("type").GetString() == "text")
                 {
                     var from = message.GetProperty("from").GetString();
@@ -98,7 +119,8 @@ namespace WhatsApp_Endpoints.Entities
 
                     using var conn = new SqlConnection(_configuration.GetConnectionString("DefaultConnection"));
                     await conn.ExecuteAsync(
-                        "INSERT INTO WhatsAppMessages (PhoneNumber, Direction, Content, Timestamp) VALUES (@from, 'inbound', @content, GETUTCDATE())",
+                        @"INSERT INTO WhatsAppMessages (PhoneNumber, Direction, Content, Timestamp, MessageType) 
+                          VALUES (@from, 'inbound', @content, GETUTCDATE(), 'text')",
                         new { from, content });
                 }
 
@@ -111,11 +133,13 @@ namespace WhatsApp_Endpoints.Entities
             }
         }
 
-
         [HttpGet("messages/{number}")]
         public async Task<IActionResult> GetMessages(string number)
         {
-            var sql = "SELECT PhoneNumber, Direction, Content, Timestamp FROM WhatsAppMessages WHERE PhoneNumber = @Number ORDER BY Timestamp ASC";
+            var sql = @"SELECT PhoneNumber, Direction, Content, Timestamp, MessageType 
+                        FROM WhatsAppMessages 
+                        WHERE PhoneNumber = @Number 
+                        ORDER BY Timestamp ASC";
 
             using var conn = new SqlConnection(_configuration.GetConnectionString("DefaultConnection"));
             var messages = await conn.QueryAsync(sql, new { Number = number });
@@ -123,4 +147,5 @@ namespace WhatsApp_Endpoints.Entities
             return Ok(messages);
         }
     }
+
 }
