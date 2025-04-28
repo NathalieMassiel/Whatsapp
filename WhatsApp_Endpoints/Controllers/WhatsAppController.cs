@@ -61,8 +61,9 @@ namespace YourNamespaceHere
 
             return Ok(new { success = "Message sent successfully!" });
         }
+
         [HttpPost("save-template-message")]
-        public async Task<IActionResult> SaveTemplateMessage([FromBody] WhatsApp_Endpoints.Entities.SaveTemplateMessageRequestDto request)
+        public async Task<IActionResult> SaveTemplateMessage([FromBody] SaveTemplateMessageRequestDto request)
         {
             try
             {
@@ -146,6 +147,17 @@ namespace YourNamespaceHere
 
             return Ok(messages);
         }
-    }
 
+        // ✅ Nuevo Endpoint: obtener lista de números de teléfono únicos (chats)
+        [HttpGet("conversations")]
+        public async Task<IActionResult> GetConversations()
+        {
+            var sql = @"SELECT DISTINCT PhoneNumber FROM WhatsAppMessages";
+
+            using var conn = new SqlConnection(_configuration.GetConnectionString("DefaultConnection"));
+            var numbers = await conn.QueryAsync<string>(sql);
+
+            return Ok(numbers);
+        }
+    }
 }
