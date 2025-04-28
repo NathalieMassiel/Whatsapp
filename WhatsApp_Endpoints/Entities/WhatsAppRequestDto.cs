@@ -3,10 +3,10 @@
    
         public class WhatsAppRequestDto
         {
-        public string Direction { get; set; }
-        public string Content { get; set; }
-        public DateTime Timestamp { get; set; }
-        public string MessageType { get; set; }
+        public required string MetaToken { get; set; }
+        public required string PhoneNumberId { get; set; }
+        public required string EndUserNumber { get; set; }
+        public required string Message { get; set; }
     }
     
 
