@@ -133,20 +133,24 @@ namespace YourNamespaceHere
                 return BadRequest(new { error = ex.Message });
             }
         }
-
         [HttpGet("messages/{number}")]
         public async Task<IActionResult> GetMessages(string number)
         {
-            var sql = @"SELECT PhoneNumber, Direction, Content, Timestamp, MessageType 
-                        FROM WhatsAppMessages 
-                        WHERE PhoneNumber = @Number 
-                        ORDER BY Timestamp ASC";
+            var sql = @"SELECT 
+                    Direction,
+                    Content,
+                    Timestamp,
+                    MessageType
+                FROM WhatsAppMessages
+                WHERE PhoneNumber = @Number
+                ORDER BY Timestamp ASC";
 
             using var conn = new SqlConnection(_configuration.GetConnectionString("DefaultConnection"));
             var messages = await conn.QueryAsync(sql, new { Number = number });
 
             return Ok(messages);
         }
+
 
         // ✅ Nuevo Endpoint: obtener lista de números de teléfono únicos (chats)
         [HttpGet("conversations")]
