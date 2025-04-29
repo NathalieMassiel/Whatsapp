@@ -62,6 +62,64 @@ namespace YourNamespaceHere
             return Ok(new { success = "Message sent successfully!" });
         }
 
+        [HttpPost("send-template-message")]
+        public async Task<IActionResult> SendTemplateMessage([FromBody] SendTemplateRequestDto request)
+        {
+            try
+            {
+                string metaToken = request.MetaToken ?? _configuration["META_TOKEN"] ?? string.Empty;
+                if (string.IsNullOrEmpty(metaToken))
+                    return BadRequest(new { error = "Missing META token" });
+
+                using var conn = new SqlConnection(_configuration.GetConnectionString("DefaultConnection"));
+
+                // 1. Buscar contenido del template en la base de datos
+                var templateContent = await conn.QueryFirstOrDefaultAsync<string>(
+                    "SELECT Content FROM Templates WHERE Name = @Name", new { Name = request.TemplateName });
+
+                if (templateContent == null)
+                    return BadRequest(new { error = "Template not found in local database." });
+
+                // 2. Reemplazar {{Name}} por el nombre del usuario
+                var personalizedContent = templateContent.Replace("{{Name}}", request.UserName ?? "Cliente");
+
+                // 3. Enviar el mensaje a WhatsApp
+                var payload = new
+                {
+                    messaging_product = "whatsapp",
+                    to = request.EndUserNumber,
+                    text = new { body = personalizedContent }
+                };
+
+                var httpRequest = new HttpRequestMessage(
+                    HttpMethod.Post,
+                    $"https://graph.facebook.com/v22.0/{request.PhoneNumberId}/messages")
+                {
+                    Headers = { { "Authorization", $"Bearer {metaToken}" } },
+                    Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
+                };
+
+                var response = await _httpClient.SendAsync(httpRequest);
+                var responseData = await response.Content.ReadAsStringAsync();
+
+                if (!response.IsSuccessStatusCode)
+                    return BadRequest(new { error = "Failed to send message", details = responseData });
+
+                // 4. Guardar el mensaje en la tabla de WhatsAppMessages
+                await conn.ExecuteAsync(
+                    @"INSERT INTO WhatsAppMessages (PhoneNumber, Direction, Content, Timestamp, MessageType) 
+                      VALUES (@to, 'outbound', @body, GETUTCDATE(), 'template')",
+                    new { to = request.EndUserNumber, body = personalizedContent });
+
+                return Ok(new { success = "Template message sent successfully!" });
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error in SendTemplateMessage: {ex.Message}");
+                return BadRequest(new { error = ex.Message });
+            }
+        }
+
         [HttpPost("save-template-message")]
         public async Task<IActionResult> SaveTemplateMessage([FromBody] SaveTemplateMessageRequestDto request)
         {
@@ -133,6 +191,7 @@ namespace YourNamespaceHere
                 return BadRequest(new { error = ex.Message });
             }
         }
+
         [HttpGet("messages/{number}")]
         public async Task<IActionResult> GetMessages(string number)
         {
@@ -151,8 +210,6 @@ namespace YourNamespaceHere
             return Ok(messages);
         }
 
-
-        // ✅ Nuevo Endpoint: obtener lista de números de teléfono únicos (chats)
         [HttpGet("conversations")]
         public async Task<IActionResult> GetConversations()
         {
