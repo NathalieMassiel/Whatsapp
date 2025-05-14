@@ -220,5 +220,72 @@ namespace YourNamespaceHere
 
             return Ok(numbers);
         }
+
+        [HttpPost("send-bulk-template")]
+        public async Task<IActionResult> SendBulkTemplate([FromBody] BulkTemplateRequestDto request)
+        {
+            string metaToken = request.MetaToken ?? _configuration["META_TOKEN"] ?? string.Empty;
+            if (string.IsNullOrEmpty(metaToken))
+                return BadRequest(new { error = "Missing META token" });
+
+            using var conn = new SqlConnection(_configuration.GetConnectionString("DefaultConnection"));
+
+            // Obtener contenido del template
+            var templateContent = await conn.QueryFirstOrDefaultAsync<string>(
+                "SELECT Content FROM Templates WHERE Name = @Name", new { Name = request.TemplateName });
+
+            if (templateContent == null)
+                return BadRequest(new { error = "Template not found." });
+
+            // Obtener los contactos del grupo
+            var contactos = await conn.QueryAsync<dynamic>(
+                @"SELECT c.Name, c.PhoneNumber
+          FROM Contacts c
+          INNER JOIN GroupContacts gc ON gc.ContactId = c.Id
+          INNER JOIN ContactGroups g ON g.Id = gc.GroupId
+          WHERE g.Name = @GroupName",
+                new { GroupName = request.GroupName });
+
+            var errores = new List<object>();
+            foreach (var contacto in contactos)
+            {
+                string personalizedContent = templateContent.Replace("{{Name}}", contacto.Name ?? "Cliente");
+
+                var payload = new
+                {
+                    messaging_product = "whatsapp",
+                    to = contacto.PhoneNumber,
+                    text = new { body = personalizedContent }
+                };
+
+                var httpRequest = new HttpRequestMessage(
+                    HttpMethod.Post,
+                    $"https://graph.facebook.com/v22.0/{request.PhoneNumberId}/messages")
+                {
+                    Headers = { { "Authorization", $"Bearer {metaToken}" } },
+                    Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
+                };
+
+                var response = await _httpClient.SendAsync(httpRequest);
+                var responseData = await response.Content.ReadAsStringAsync();
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    errores.Add(new { contacto.PhoneNumber, error = responseData });
+                    continue;
+                }
+
+                await conn.ExecuteAsync(
+                    @"INSERT INTO WhatsAppMessages (PhoneNumber, Direction, Content, Timestamp, MessageType)
+              VALUES (@PhoneNumber, 'outbound', @Content, GETUTCDATE(), 'template')",
+                    new { PhoneNumber = contacto.PhoneNumber, Content = personalizedContent });
+            }
+
+            if (errores.Count > 0)
+                return Ok(new { message = "Se enviaron algunos mensajes con errores.", errores });
+
+            return Ok(new { message = "Todos los mensajes fueron enviados correctamente." });
+        }
+
     }
 }
