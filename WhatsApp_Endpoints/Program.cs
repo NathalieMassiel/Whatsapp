@@ -2,6 +2,8 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using System.Net.Http;
+using System.Data;
+using Microsoft.Data.SqlClient;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -10,7 +12,7 @@ builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowFrontend", policy =>
     {
-        policy.WithOrigins("http://localhost:3000", "http://localhost:3001") // Agrega aquí el puerto del frontend local
+        policy.WithOrigins("http://localhost:3000", "http://localhost:3001")
               .AllowAnyHeader()
               .AllowAnyMethod();
     });
@@ -18,9 +20,12 @@ builder.Services.AddCors(options =>
 
 // Agregar configuración y dependencias
 builder.Services.AddControllers();
-builder.Services.AddHttpClient(); // Necesario para inyectar HttpClient
+builder.Services.AddHttpClient();
+builder.Services.AddScoped<IDbConnection>(sp =>
+    new SqlConnection(builder.Configuration.GetConnectionString("DefaultConnection")));
+
 builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen(); // Opcional, para probar en Swagger UI
+builder.Services.AddSwaggerGen();
 
 var app = builder.Build();
 
@@ -30,11 +35,9 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
-// Usa CORS antes del enrutamiento
 app.UseCors("AllowFrontend");
-
 app.UseHttpsRedirection();
 app.UseAuthorization();
-
 app.MapControllers();
+
 app.Run();
