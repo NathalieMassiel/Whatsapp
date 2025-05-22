@@ -251,32 +251,52 @@ namespace YourNamespaceHere
 
             foreach (var contacto in contactos)
             {
-                var payload = new
+                object payload;
+
+                // ⚠️ Si la plantilla NO tiene parámetros definidos en Meta, NO se debe enviar 'components'
+                if (request.TemplateName.ToLower() == "hello_world")  // <-- Aquí ajusta el nombre real de tu plantilla sin parámetros
                 {
-                    messaging_product = "whatsapp",
-                    to = contacto.PhoneNumber,
-                    type = "template",
-                    template = new
+                    payload = new
                     {
-                        name = request.TemplateName.ToLower(),  // Debe ser EXACTAMENTE el nombre aprobado en Meta
-                        language = new { code = "es" }, // Ajusta a "en" u otro según sea tu plantilla
-                        components = new[]
+                        messaging_product = "whatsapp",
+                        to = contacto.PhoneNumber,
+                        type = "template",
+                        template = new
                         {
-                    new
+                            name = request.TemplateName.ToLower(),
+                            language = new { code = "es" }
+                        }
+                    };
+                }
+                else
+                {
+                    payload = new
                     {
-                        type = "body",
-                        parameters = new[]
+                        messaging_product = "whatsapp",
+                        to = contacto.PhoneNumber,
+                        type = "template",
+                        template = new
                         {
-                            new { type = "text", text = contacto.Name ?? "Cliente" }
+                            name = request.TemplateName.ToLower(),
+                            language = new { code = "es" },
+                            components = new[]
+                            {
+                        new
+                        {
+                            type = "body",
+                            parameters = new[]
+                            {
+                                new { type = "text", text = contacto.Name ?? "Cliente" }
+                            }
                         }
                     }
+                        }
+                    };
                 }
-                    }
-                };
 
                 var httpRequest = new HttpRequestMessage(
                     HttpMethod.Post,
-                    $"https://graph.facebook.com/v17.0/{request.PhoneNumberId}/messages")  // Usa la versión correcta de API
+                    $"https://graph.facebook.com/v22.0/{request.PhoneNumberId}/messages")
                 {
                     Headers = { { "Authorization", $"Bearer {metaToken}" } },
                     Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
@@ -291,7 +311,6 @@ namespace YourNamespaceHere
                     continue;
                 }
 
-                // Guardar el mensaje en la base de datos como tipo "template"
                 await conn.ExecuteAsync(
                     @"INSERT INTO WhatsAppMessages (PhoneNumber, Direction, Content, Timestamp, MessageType)
               VALUES (@PhoneNumber, 'outbound', @Content, GETUTCDATE(), 'template')",
@@ -303,6 +322,5 @@ namespace YourNamespaceHere
 
             return Ok(new { message = "Todos los mensajes fueron enviados correctamente." });
         }
-
     }
 }
