@@ -82,9 +82,9 @@ namespace YourNamespaceHere
                 bool tieneVariables = templateContent.Contains("{{");
                 string languageCode = request.TemplateName.ToLower() switch
                 {
-                    "inicio_de_conversacion" => "es_ES",
+                    "inicio_de_conversacion" => "es_PAN",
                     "hello_world" => "en_US",
-                    _ => "es_ES"
+                    _ => "es_PAN"
                 };
 
                 object payload = !tieneVariables
@@ -148,6 +148,105 @@ namespace YourNamespaceHere
                 Console.WriteLine($"Error in SendTemplateMessage: {ex.Message}");
                 return BadRequest(new { error = ex.Message });
             }
+        }
+
+        [HttpPost("send-bulk-template")]
+        public async Task<IActionResult> SendBulkTemplate([FromBody] BulkTemplateRequestDto request)
+        {
+            string metaToken = request.MetaToken ?? _configuration["META_TOKEN"] ?? string.Empty;
+            if (string.IsNullOrEmpty(metaToken))
+                return BadRequest(new { error = "Missing META token" });
+
+            using var conn = new SqlConnection(_configuration.GetConnectionString("DefaultConnection"));
+
+            var templateContent = await conn.QueryFirstOrDefaultAsync<string>(
+                "SELECT Content FROM Templates WHERE Name = @Name", new { Name = request.TemplateName });
+
+            if (templateContent == null)
+                return BadRequest(new { error = "Template not found in local DB." });
+
+            bool tieneVariables = templateContent.Contains("{{");
+            string languageCode = request.TemplateName.ToLower() switch
+            {
+                "inicio_de_conversacion" => "es_PAN",
+                "hello_world" => "en_US",
+                _ => "es_PAN"
+            };
+
+            var contactos = await conn.QueryAsync<dynamic>(
+                @"SELECT c.Name, c.PhoneNumber
+                  FROM Contacts c
+                  INNER JOIN GroupContacts gc ON gc.ContactId = c.Id
+                  INNER JOIN ContactGroups g ON g.Id = gc.GroupId
+                  WHERE g.Name = @GroupName",
+                new { GroupName = request.GroupName });
+
+            var errores = new List<object>();
+
+            foreach (var contacto in contactos)
+            {
+                object payload = !tieneVariables
+                    ? new
+                    {
+                        messaging_product = "whatsapp",
+                        to = contacto.PhoneNumber,
+                        type = "template",
+                        template = new
+                        {
+                            name = request.TemplateName.ToLower(),
+                            language = new { code = languageCode }
+                        }
+                    }
+                    : new
+                    {
+                        messaging_product = "whatsapp",
+                        to = contacto.PhoneNumber,
+                        type = "template",
+                        template = new
+                        {
+                            name = request.TemplateName.ToLower(),
+                            language = new { code = languageCode },
+                            components = new[]
+                            {
+                                new
+                                {
+                                    type = "body",
+                                    parameters = new[]
+                                    {
+                                        new { type = "text", text = contacto.Name ?? "Cliente" }
+                                    }
+                                }
+                            }
+                        }
+                    };
+
+                var httpRequest = new HttpRequestMessage(
+                    HttpMethod.Post,
+                    $"https://graph.facebook.com/v22.0/{request.PhoneNumberId}/messages")
+                {
+                    Headers = { { "Authorization", $"Bearer {metaToken}" } },
+                    Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
+                };
+
+                var response = await _httpClient.SendAsync(httpRequest);
+                var responseData = await response.Content.ReadAsStringAsync();
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    errores.Add(new { contacto.PhoneNumber, error = responseData });
+                    continue;
+                }
+
+                await conn.ExecuteAsync(
+                    @"INSERT INTO WhatsAppMessages (PhoneNumber, Direction, Content, Timestamp, MessageType)
+                      VALUES (@PhoneNumber, 'outbound', @Content, GETUTCDATE(), 'template')",
+                    new { PhoneNumber = contacto.PhoneNumber, Content = $"Plantilla: {request.TemplateName}" });
+            }
+
+            if (errores.Count > 0)
+                return Ok(new { message = "Se enviaron algunos mensajes con errores.", errores });
+
+            return Ok(new { message = "Todos los mensajes fueron enviados correctamente." });
         }
 
         [HttpPost("save-template-message")]
