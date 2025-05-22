@@ -1,17 +1,18 @@
 ﻿using Microsoft.AspNetCore.Mvc;
-using System.Net.Http;
-using System.Text.Json;
-using System.Text;
-using System.Threading.Tasks;
-using Microsoft.Extensions.Configuration;
 using System;
-using Microsoft.Data.SqlClient;
-using Dapper;
 using System.Collections.Generic;
+using System.Net.Http;
+using System.Text;
+using System.Text.Json;
+using System.Threading.Tasks;
+using Dapper;
+using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Configuration;
 using WhatsApp_Endpoints.Entities;
 
 namespace YourNamespaceHere
 {
+  
     [ApiController]
     [Route("api/whatsapp")]
     public class WhatsAppController : ControllerBase
@@ -25,12 +26,13 @@ namespace YourNamespaceHere
             _httpClient = httpClient;
         }
 
+        // 1) Envío de mensaje libre
         [HttpPost("send-message")]
         public async Task<IActionResult> SendMessage([FromForm] WhatsAppRequestDto request)
         {
-            string metaToken = request.MetaToken ?? _configuration["META_TOKEN"] ?? string.Empty;
-            if (string.IsNullOrEmpty(metaToken))
-                return BadRequest(new { error = "Missing META token" });
+            var token = request.MetaToken ?? _configuration["META_TOKEN"] ?? "";
+            if (string.IsNullOrWhiteSpace(token))
+                return BadRequest("Missing META token");
 
             var payload = new
             {
@@ -39,61 +41,160 @@ namespace YourNamespaceHere
                 text = new { body = request.Message }
             };
 
-            var httpRequest = new HttpRequestMessage(
+            var httpReq = new HttpRequestMessage(
                 HttpMethod.Post,
                 $"https://graph.facebook.com/v22.0/{request.PhoneNumberId}/messages")
             {
-                Headers = { { "Authorization", $"Bearer {metaToken}" } },
+                Headers = { { "Authorization", $"Bearer {token}" } },
                 Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
             };
 
-            var response = await _httpClient.SendAsync(httpRequest);
-            var responseData = await response.Content.ReadAsStringAsync();
+            var resp = await _httpClient.SendAsync(httpReq);
+            var respBody = await resp.Content.ReadAsStringAsync();
+            if (!resp.IsSuccessStatusCode)
+                return BadRequest(new { error = respBody });
 
-            if (!response.IsSuccessStatusCode)
-                return BadRequest(new { error = "Failed to send message", details = responseData });
-
-            using var conn = new SqlConnection(_configuration.GetConnectionString("DefaultConnection"));
+            // Guardar en BD
+            await using var conn = new SqlConnection(_configuration.GetConnectionString("DefaultConnection"));
             await conn.ExecuteAsync(
-                @"INSERT INTO WhatsAppMessages (PhoneNumber, Direction, Content, Timestamp, MessageType) 
+                @"INSERT INTO WhatsAppMessages (PhoneNumber, Direction, Content, Timestamp, MessageType)
                   VALUES (@to, 'outbound', @body, GETUTCDATE(), 'text')",
                 new { to = request.EndUserNumber, body = request.Message });
 
-            return Ok(new { success = "Message sent successfully!" });
+            return Ok(new { success = true });
         }
 
+        // 2) Envío de UNA plantilla individual
         [HttpPost("send-template-message")]
         public async Task<IActionResult> SendTemplateMessage([FromBody] SendTemplateRequestDto request)
         {
-            try
+            var token = request.MetaToken ?? _configuration["META_TOKEN"] ?? "";
+            if (string.IsNullOrWhiteSpace(token))
+                return BadRequest("Missing META token");
+
+            await using var conn = new SqlConnection(_configuration.GetConnectionString("DefaultConnection"));
+
+            // Obtener contenido y ver si tiene {{Name}}
+            var templateContent = await conn.QueryFirstOrDefaultAsync<string>(
+                "SELECT Content FROM Templates WHERE Name = @Name",
+                new { Name = request.TemplateName });
+            if (templateContent == null)
+                return BadRequest("Template not found in DB");
+
+            bool tieneVariables = templateContent.Contains("{{");
+            var personalizedContent = templateContent.Replace("{{Name}}", request.UserName ?? "Cliente");
+
+            // Detectar idioma exacto
+            string languageCode = request.TemplateName.ToLower() switch
             {
-                string metaToken = request.MetaToken ?? _configuration["META_TOKEN"] ?? string.Empty;
-                if (string.IsNullOrEmpty(metaToken))
-                    return BadRequest(new { error = "Missing META token" });
+                "inicio_de_conversacion" => "es_PAN",
+                "hello_world" => "en_US",
+                _ => "es_PAN"
+            };
 
-                using var conn = new SqlConnection(_configuration.GetConnectionString("DefaultConnection"));
-
-                var templateContent = await conn.QueryFirstOrDefaultAsync<string>(
-                    "SELECT Content FROM Templates WHERE Name = @Name", new { Name = request.TemplateName });
-
-                if (templateContent == null)
-                    return BadRequest(new { error = "Template not found in local database." });
-
-                bool tieneVariables = templateContent.Contains("{{");
-                string personalizedContent = templateContent.Replace("{{Name}}", request.UserName ?? "Cliente");
-
-                string languageCode = request.TemplateName.ToLower() switch
+            // Construir payload template
+            object payload = !tieneVariables
+                ? new
                 {
-                    "inicio_de_conversacion" => "es_PAN",
-                    "hello_world" => "en_US",
-                    _ => "es_PAN"
+                    messaging_product = "whatsapp",
+                    to = request.EndUserNumber,
+                    type = "template",
+                    template = new
+                    {
+                        name = request.TemplateName.ToLower(),
+                        language = new { code = languageCode }
+                    }
+                }
+                : new
+                {
+                    messaging_product = "whatsapp",
+                    to = request.EndUserNumber,
+                    type = "template",
+                    template = new
+                    {
+                        name = request.TemplateName.ToLower(),
+                        language = new { code = languageCode },
+                        components = new[]
+                        {
+                            new {
+                                type       = "body",
+                                parameters = new[] { new { type = "text", text = request.UserName ?? "Cliente" } }
+                            }
+                        }
+                    }
                 };
 
+            var httpReq = new HttpRequestMessage(
+                HttpMethod.Post,
+                $"https://graph.facebook.com/v22.0/{request.PhoneNumberId}/messages")
+            {
+                Headers = { { "Authorization", $"Bearer {token}" } },
+                Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
+            };
+
+            var resp = await _httpClient.SendAsync(httpReq);
+            var respBody = await resp.Content.ReadAsStringAsync();
+            if (!resp.IsSuccessStatusCode)
+                return BadRequest(new { error = respBody });
+
+            // Guardar el mensaje real
+            await conn.ExecuteAsync(
+                @"INSERT INTO WhatsAppMessages (PhoneNumber, Direction, Content, Timestamp, MessageType)
+                  VALUES (@to, 'outbound', @body, GETUTCDATE(), 'template')",
+                new { to = request.EndUserNumber, body = personalizedContent });
+
+            return Ok(new { success = true });
+        }
+
+        // 3) Envío de plantilla MASIVO por grupo
+        [HttpPost("send-bulk-template")]
+        public async Task<IActionResult> SendBulkTemplate([FromBody] BulkTemplateRequestDto request)
+        {
+            var token = request.MetaToken ?? _configuration["META_TOKEN"] ?? "";
+            if (string.IsNullOrWhiteSpace(token))
+                return BadRequest("Missing META token");
+
+            await using var conn = new SqlConnection(_configuration.GetConnectionString("DefaultConnection"));
+
+            // Obtener contenido y variable
+            var templateContent = await conn.QueryFirstOrDefaultAsync<string>(
+                "SELECT Content FROM Templates WHERE Name = @Name",
+                new { Name = request.TemplateName });
+            if (templateContent == null)
+                return BadRequest("Template not found in DB");
+
+            bool tieneVariables = templateContent.Contains("{{");
+            string languageCode = request.TemplateName.ToLower() switch
+            {
+                "inicio_de_conversacion" => "es_PAN",
+                "hello_world" => "en_US",
+                _ => "es_PAN"
+            };
+
+            // Cargar contactos del grupo
+            var contactos = await conn.QueryAsync<dynamic>(
+                @"
+                  SELECT c.Name, c.PhoneNumber
+                    FROM Contacts c
+                   INNER JOIN GroupContacts gc ON gc.ContactId = c.Id
+                   INNER JOIN ContactGroups g   ON g.Id       = gc.GroupId
+                   WHERE g.Name = @GroupName
+                ",
+                new { GroupName = request.GroupName }
+            );
+
+            var errores = new List<object>();
+            foreach (var contacto in contactos)
+            {
+                // Personalizar contenido
+                var personalizedContent = templateContent.Replace("{{Name}}", contacto.Name ?? "Cliente");
+
+                // Armar payload
                 object payload = !tieneVariables
                     ? new
                     {
                         messaging_product = "whatsapp",
-                        to = request.EndUserNumber,
+                        to = contacto.PhoneNumber,
                         type = "template",
                         template = new
                         {
@@ -104,7 +205,7 @@ namespace YourNamespaceHere
                     : new
                     {
                         messaging_product = "whatsapp",
-                        to = request.EndUserNumber,
+                        to = contacto.PhoneNumber,
                         type = "template",
                         template = new
                         {
@@ -112,125 +213,68 @@ namespace YourNamespaceHere
                             language = new { code = languageCode },
                             components = new[]
                             {
-                                new
-                                {
-                                    type = "body",
-                                    parameters = new[]
-                                    {
-                                        new { type = "text", text = request.UserName ?? "Cliente" }
-                                    }
+                                new {
+                                    type       = "body",
+                                    parameters = new[] { new { type = "text", text = contacto.Name ?? "Cliente" } }
                                 }
                             }
                         }
                     };
 
-                var httpRequest = new HttpRequestMessage(
+                // Enviar
+                var httpReq = new HttpRequestMessage(
                     HttpMethod.Post,
                     $"https://graph.facebook.com/v22.0/{request.PhoneNumberId}/messages")
                 {
-                    Headers = { { "Authorization", $"Bearer {metaToken}" } },
+                    Headers = { { "Authorization", $"Bearer {token}" } },
                     Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
                 };
 
-                var response = await _httpClient.SendAsync(httpRequest);
-                var responseData = await response.Content.ReadAsStringAsync();
+                var resp = await _httpClient.SendAsync(httpReq);
+                var respBody = await resp.Content.ReadAsStringAsync();
+                if (!resp.IsSuccessStatusCode)
+                {
+                    errores.Add(new { contacto.PhoneNumber, error = respBody });
+                    continue;
+                }
 
-                if (!response.IsSuccessStatusCode)
-                    return BadRequest(new { error = "Failed to send template", details = responseData });
-
+                // Guardar en BD
                 await conn.ExecuteAsync(
-                    @"INSERT INTO WhatsAppMessages (PhoneNumber, Direction, Content, Timestamp, MessageType) 
-                      VALUES (@to, 'outbound', @body, GETUTCDATE(), 'template')",
-                    new { to = request.EndUserNumber, body = personalizedContent });
+                    @"INSERT INTO WhatsAppMessages (PhoneNumber, Direction, Content, Timestamp, MessageType)
+                      VALUES (@pn, 'outbound', @body, GETUTCDATE(), 'template')",
+                    new { pn = contacto.PhoneNumber, body = personalizedContent });
+            }
 
-                return Ok(new { success = "Template message sent successfully!" });
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error in SendTemplateMessage: {ex.Message}");
-                return BadRequest(new { error = ex.Message });
-            }
+            if (errores.Count > 0)
+                return Ok(new { message = "Algunos mensajes fallaron", errores });
+
+            return Ok(new { message = "Campaña enviada a todo el grupo correctamente." });
         }
 
-        [HttpGet("messages/{number}")]
-        public async Task<IActionResult> GetMessages(string number)
-        {
-            var sql = @"SELECT 
-                    Direction,
-                    Content,
-                    Timestamp,
-                    MessageType
-                FROM WhatsAppMessages
-                WHERE PhoneNumber = @Number
-                ORDER BY Timestamp ASC";
-
-            using var conn = new SqlConnection(_configuration.GetConnectionString("DefaultConnection"));
-            var messages = await conn.QueryAsync(sql, new { Number = number });
-
-            return Ok(messages);
-        }
-
+        // 4) Obtener lista de conversaciones
         [HttpGet("conversations")]
         public async Task<IActionResult> GetConversations()
         {
-            var sql = @"SELECT DISTINCT PhoneNumber FROM WhatsAppMessages";
-
-            using var conn = new SqlConnection(_configuration.GetConnectionString("DefaultConnection"));
-            var numbers = await conn.QueryAsync<string>(sql);
-
-            return Ok(numbers);
+            await using var conn = new SqlConnection(_configuration.GetConnectionString("DefaultConnection"));
+            var nums = await conn.QueryAsync<string>(
+                "SELECT DISTINCT PhoneNumber FROM WhatsAppMessages");
+            return Ok(nums);
         }
 
-        [HttpPost("webhook")]
-        public async Task<IActionResult> ReceiveWebhook([FromBody] JsonDocument body)
+        // 5) Obtener mensajes de un número
+        [HttpGet("messages/{number}")]
+        public async Task<IActionResult> GetMessages(string number)
         {
-            try
-            {
-                var entry = body.RootElement.GetProperty("entry")[0];
-                var changes = entry.GetProperty("changes")[0];
-                var value = changes.GetProperty("value");
-
-                if (!value.TryGetProperty("messages", out var messagesElement) || messagesElement.GetArrayLength() == 0)
-                {
-                    Console.WriteLine("Webhook recibido sin mensajes. Puede ser una notificación de estado.");
-                    return Ok();
-                }
-
-                var message = messagesElement[0];
-
-                if (message.GetProperty("type").GetString() == "text")
-                {
-                    var from = message.GetProperty("from").GetString();
-                    var content = message.GetProperty("text").GetProperty("body").GetString();
-
-                    Console.WriteLine($"Mensaje INBOUND recibido de {from}: {content}");
-
-                    using var conn = new SqlConnection(_configuration.GetConnectionString("DefaultConnection"));
-                    await conn.ExecuteAsync(
-                        @"INSERT INTO WhatsAppMessages (PhoneNumber, Direction, Content, Timestamp, MessageType) 
-                          VALUES (@from, 'inbound', @content, GETUTCDATE(), 'text')",
-                        new { from, content });
-                }
-
-                return Ok();
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error en ReceiveWebhook: {ex.Message}");
-                return BadRequest(new { error = ex.Message });
-            }
-        }
-
-        [HttpGet("webhook")]
-        public IActionResult VerifyWebhook(
-            [FromQuery(Name = "hub.mode")] string hubMode,
-            [FromQuery(Name = "hub.verify_token")] string hubVerifyToken,
-            [FromQuery(Name = "hub.challenge")] string hubChallenge)
-        {
-            if (hubMode == "subscribe" && hubVerifyToken == "abc123")
-                return Content(hubChallenge, "text/plain");
-
-            return Forbid();
+            await using var conn = new SqlConnection(_configuration.GetConnectionString("DefaultConnection"));
+            var msgs = await conn.QueryAsync(
+                @"
+                  SELECT Direction, Content, Timestamp, MessageType
+                    FROM WhatsAppMessages
+                   WHERE PhoneNumber = @num
+                ORDER BY Timestamp ASC",
+                new { num = number }
+            );
+            return Ok(msgs);
         }
     }
 }
