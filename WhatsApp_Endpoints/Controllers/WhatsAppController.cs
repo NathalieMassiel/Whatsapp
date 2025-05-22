@@ -73,23 +73,53 @@ namespace YourNamespaceHere
 
                 using var conn = new SqlConnection(_configuration.GetConnectionString("DefaultConnection"));
 
-                // 1. Buscar contenido del template en la base de datos
-                var templateContent = await conn.QueryFirstOrDefaultAsync<string>(
-                    "SELECT Content FROM Templates WHERE Name = @Name", new { Name = request.TemplateName });
+                var templateExists = await conn.QueryFirstOrDefaultAsync<string>(
+                    "SELECT Name FROM Templates WHERE Name = @Name", new { Name = request.TemplateName });
 
-                if (templateContent == null)
+                if (templateExists == null)
                     return BadRequest(new { error = "Template not found in local database." });
 
-                // 2. Reemplazar {{Name}} por el nombre del usuario
-                var personalizedContent = templateContent.Replace("{{Name}}", request.UserName ?? "Cliente");
+                object payload;
 
-                // 3. Enviar el mensaje a WhatsApp
-                var payload = new
+                if (request.TemplateName.ToLower() == "hello_world") // plantilla sin variables
                 {
-                    messaging_product = "whatsapp",
-                    to = request.EndUserNumber,
-                    text = new { body = personalizedContent }
-                };
+                    payload = new
+                    {
+                        messaging_product = "whatsapp",
+                        to = request.EndUserNumber,
+                        type = "template",
+                        template = new
+                        {
+                            name = request.TemplateName.ToLower(),
+                            language = new { code = "es" }
+                        }
+                    };
+                }
+                else
+                {
+                    payload = new
+                    {
+                        messaging_product = "whatsapp",
+                        to = request.EndUserNumber,
+                        type = "template",
+                        template = new
+                        {
+                            name = request.TemplateName.ToLower(),
+                            language = new { code = "es" },
+                            components = new[]
+                            {
+                                new
+                                {
+                                    type = "body",
+                                    parameters = new[]
+                                    {
+                                        new { type = "text", text = request.UserName ?? "Cliente" }
+                                    }
+                                }
+                            }
+                        }
+                    };
+                }
 
                 var httpRequest = new HttpRequestMessage(
                     HttpMethod.Post,
@@ -103,13 +133,12 @@ namespace YourNamespaceHere
                 var responseData = await response.Content.ReadAsStringAsync();
 
                 if (!response.IsSuccessStatusCode)
-                    return BadRequest(new { error = "Failed to send message", details = responseData });
+                    return BadRequest(new { error = "Failed to send template", details = responseData });
 
-                // 4. Guardar el mensaje en la tabla de WhatsAppMessages
                 await conn.ExecuteAsync(
                     @"INSERT INTO WhatsAppMessages (PhoneNumber, Direction, Content, Timestamp, MessageType) 
                       VALUES (@to, 'outbound', @body, GETUTCDATE(), 'template')",
-                    new { to = request.EndUserNumber, body = personalizedContent });
+                    new { to = request.EndUserNumber, body = $"Plantilla: {request.TemplateName}" });
 
                 return Ok(new { success = "Template message sent successfully!" });
             }
@@ -230,7 +259,6 @@ namespace YourNamespaceHere
 
             using var conn = new SqlConnection(_configuration.GetConnectionString("DefaultConnection"));
 
-            // Validar que la plantilla exista en la base de datos (opcional)
             var templateExists = await conn.QueryFirstOrDefaultAsync<string>(
                 "SELECT Name FROM Templates WHERE Name = @Name",
                 new { Name = request.TemplateName });
@@ -238,13 +266,12 @@ namespace YourNamespaceHere
             if (templateExists == null)
                 return BadRequest(new { error = "Template not found in local DB." });
 
-            // Obtener contactos del grupo
             var contactos = await conn.QueryAsync<dynamic>(
                 @"SELECT c.Name, c.PhoneNumber
-          FROM Contacts c
-          INNER JOIN GroupContacts gc ON gc.ContactId = c.Id
-          INNER JOIN ContactGroups g ON g.Id = gc.GroupId
-          WHERE g.Name = @GroupName",
+                  FROM Contacts c
+                  INNER JOIN GroupContacts gc ON gc.ContactId = c.Id
+                  INNER JOIN ContactGroups g ON g.Id = gc.GroupId
+                  WHERE g.Name = @GroupName",
                 new { GroupName = request.GroupName });
 
             var errores = new List<object>();
@@ -253,8 +280,7 @@ namespace YourNamespaceHere
             {
                 object payload;
 
-                // ⚠️ Si la plantilla NO tiene parámetros definidos en Meta, NO se debe enviar 'components'
-                if (request.TemplateName.ToLower() == "hello_world")  // <-- Aquí ajusta el nombre real de tu plantilla sin parámetros
+                if (request.TemplateName.ToLower() == "hello_world")
                 {
                     payload = new
                     {
@@ -281,15 +307,15 @@ namespace YourNamespaceHere
                             language = new { code = "es" },
                             components = new[]
                             {
-                        new
-                        {
-                            type = "body",
-                            parameters = new[]
-                            {
-                                new { type = "text", text = contacto.Name ?? "Cliente" }
+                                new
+                                {
+                                    type = "body",
+                                    parameters = new[]
+                                    {
+                                        new { type = "text", text = contacto.Name ?? "Cliente" }
+                                    }
+                                }
                             }
-                        }
-                    }
                         }
                     };
                 }
@@ -313,7 +339,7 @@ namespace YourNamespaceHere
 
                 await conn.ExecuteAsync(
                     @"INSERT INTO WhatsAppMessages (PhoneNumber, Direction, Content, Timestamp, MessageType)
-              VALUES (@PhoneNumber, 'outbound', @Content, GETUTCDATE(), 'template')",
+                      VALUES (@PhoneNumber, 'outbound', @Content, GETUTCDATE(), 'template')",
                     new { PhoneNumber = contacto.PhoneNumber, Content = $"Plantilla: {request.TemplateName}" });
             }
 
