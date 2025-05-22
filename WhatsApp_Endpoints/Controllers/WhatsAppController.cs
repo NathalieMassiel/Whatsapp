@@ -230,14 +230,15 @@ namespace YourNamespaceHere
 
             using var conn = new SqlConnection(_configuration.GetConnectionString("DefaultConnection"));
 
-            // Obtener contenido del template
-            var templateContent = await conn.QueryFirstOrDefaultAsync<string>(
-                "SELECT Content FROM Templates WHERE Name = @Name", new { Name = request.TemplateName });
+            // Validar que la plantilla exista en la base de datos (opcional)
+            var templateExists = await conn.QueryFirstOrDefaultAsync<string>(
+                "SELECT Name FROM Templates WHERE Name = @Name",
+                new { Name = request.TemplateName });
 
-            if (templateContent == null)
-                return BadRequest(new { error = "Template not found." });
+            if (templateExists == null)
+                return BadRequest(new { error = "Template not found in local DB." });
 
-            // Obtener los contactos del grupo
+            // Obtener contactos del grupo
             var contactos = await conn.QueryAsync<dynamic>(
                 @"SELECT c.Name, c.PhoneNumber
           FROM Contacts c
@@ -247,20 +248,35 @@ namespace YourNamespaceHere
                 new { GroupName = request.GroupName });
 
             var errores = new List<object>();
+
             foreach (var contacto in contactos)
             {
-                string personalizedContent = templateContent.Replace("{{Name}}", contacto.Name ?? "Cliente");
-
                 var payload = new
                 {
                     messaging_product = "whatsapp",
                     to = contacto.PhoneNumber,
-                    text = new { body = personalizedContent }
+                    type = "template",
+                    template = new
+                    {
+                        name = request.TemplateName.ToLower(),  // Debe ser EXACTAMENTE el nombre aprobado en Meta
+                        language = new { code = "es" }, // Ajusta a "en" u otro según sea tu plantilla
+                        components = new[]
+                        {
+                    new
+                    {
+                        type = "body",
+                        parameters = new[]
+                        {
+                            new { type = "text", text = contacto.Name ?? "Cliente" }
+                        }
+                    }
+                }
+                    }
                 };
 
                 var httpRequest = new HttpRequestMessage(
                     HttpMethod.Post,
-                    $"https://graph.facebook.com/v22.0/{request.PhoneNumberId}/messages")
+                    $"https://graph.facebook.com/v17.0/{request.PhoneNumberId}/messages")  // Usa la versión correcta de API
                 {
                     Headers = { { "Authorization", $"Bearer {metaToken}" } },
                     Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
@@ -275,10 +291,11 @@ namespace YourNamespaceHere
                     continue;
                 }
 
+                // Guardar el mensaje en la base de datos como tipo "template"
                 await conn.ExecuteAsync(
                     @"INSERT INTO WhatsAppMessages (PhoneNumber, Direction, Content, Timestamp, MessageType)
               VALUES (@PhoneNumber, 'outbound', @Content, GETUTCDATE(), 'template')",
-                    new { PhoneNumber = contacto.PhoneNumber, Content = personalizedContent });
+                    new { PhoneNumber = contacto.PhoneNumber, Content = $"Plantilla: {request.TemplateName}" });
             }
 
             if (errores.Count > 0)
